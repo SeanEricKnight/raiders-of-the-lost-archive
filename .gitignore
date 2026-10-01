@@ -1,0 +1,5 @@
+# Generated inventories can contain private paths, usernames, and document metadata.
+*.csv
+*.xlsx
+*.tmp
+FolderReviewReports/
