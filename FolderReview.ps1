@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
   Inventory one source folder and its descendants on an archaeological expedition,
   however many layers of archived civilization stand between them and the workbook.
@@ -10,7 +10,7 @@
   Copy reviewed rows into the team's shared workbook manually.
 
   Prompts for source and report folders when paths are omitted. The source menu
-  offers a Windows folder picker, typed paths, and desktop/documents/downloads.
+  offers a Windows folder picker, typed paths, desktop/documents/downloads, and mapped network drives.
   A full path or drive letter can also be entered directly at the menu.
   OwnerAlias defaults to no substitutions. ReviewerNotes preserves the true owner
   for any alias supplied. ExcludeFolder applies to top-level folders of the source only.
@@ -149,6 +149,181 @@ function Resolve-SourceInput {
         '^[A-Za-z]:?$'       { return ($Text.Substring(0,1).ToUpper() + ':\') }
     }
     return [Environment]::ExpandEnvironmentVariables($Text)
+}
+
+
+function Get-LocalDrives {
+    # Return fixed local filesystem drives visible to the security context running this script.
+    $Drives = @()
+    try {
+        $Drives = @(Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType = 3' -ErrorAction Stop |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.DeviceID) } |
+            Sort-Object DeviceID |
+            ForEach-Object {
+                $Name = ([string]$_.DeviceID).TrimEnd(':').ToUpperInvariant()
+                [pscustomobject]@{
+                    Name       = $Name
+                    Root       = ($Name + ':\')
+                    VolumeName = [string]$_.VolumeName
+                }
+            })
+    } catch {
+        try {
+            $Drives = @(Get-PSDrive -PSProvider FileSystem -ErrorAction Stop |
+                Where-Object {
+                    $_.Name -match '^[A-Za-z]$' -and
+                    ([string]::IsNullOrWhiteSpace([string]$_.DisplayRoot) -or -not ([string]$_.DisplayRoot).StartsWith('\\'))
+                } |
+                Sort-Object Name |
+                ForEach-Object {
+                    [pscustomobject]@{ Name = ([string]$_.Name).ToUpperInvariant(); Root = (([string]$_.Name).ToUpperInvariant() + ':\'); VolumeName = '' }
+                })
+        } catch {}
+    }
+    return $Drives
+}
+
+function Get-MappedNetworkDrives {
+    # Return mapped drive letters visible to the security context running this script.
+    # Combine CIM and PowerShell views because either one can occasionally omit a mapping.
+    $ByName = @{}
+
+    try {
+        foreach ($Drive in @(Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType = 4' -ErrorAction Stop)) {
+            if ([string]::IsNullOrWhiteSpace([string]$Drive.DeviceID)) { continue }
+            $Name = ([string]$Drive.DeviceID).TrimEnd(':').ToUpperInvariant()
+            $ByName[$Name] = [pscustomobject]@{
+                Name       = $Name
+                Root       = ($Name + ':\')
+                RemotePath = [string]$Drive.ProviderName
+            }
+        }
+    } catch {}
+
+    try {
+        foreach ($Drive in @(Get-PSDrive -PSProvider FileSystem -ErrorAction Stop)) {
+            $RemotePath = ''
+            if ($Drive.PSObject.Properties['DisplayRoot']) { $RemotePath = [string]$Drive.DisplayRoot }
+            if ([string]::IsNullOrWhiteSpace($RemotePath) -or -not $RemotePath.StartsWith('\\')) { continue }
+            $Name = ([string]$Drive.Name).ToUpperInvariant()
+            if (-not $ByName.ContainsKey($Name)) {
+                $ByName[$Name] = [pscustomobject]@{
+                    Name       = $Name
+                    Root       = ($Name + ':\')
+                    RemotePath = $RemotePath
+                }
+            } elseif ([string]::IsNullOrWhiteSpace([string]$ByName[$Name].RemotePath)) {
+                $ByName[$Name].RemotePath = $RemotePath
+            }
+        }
+    } catch {}
+
+    return @($ByName.Values | Sort-Object Name)
+}
+
+function Select-SourceMenu {
+    param([object[]]$Choices)
+
+    $SelectableIndexes = @()
+    for ($i = 0; $i -lt $Choices.Count; $i++) {
+        if ($Choices[$i].Kind -notin @('Header', 'Spacer')) { $SelectableIndexes += $i }
+    }
+    if ($SelectableIndexes.Count -eq 0) { return $null }
+
+    $CanUseKeys = $false
+    try {
+        $CanUseKeys = $script:UseVT -and -not $script:NumberedMenu -and
+            $Host.Name -eq 'ConsoleHost' -and -not [Console]::IsInputRedirected
+        if ($CanUseKeys) { $null = [Console]::KeyAvailable }
+    } catch { $CanUseKeys = $false }
+
+    if ($CanUseKeys) {
+        $SelectedPos = 0
+        $Selected = $SelectableIndexes[$SelectedPos]
+        $Drawn = 0
+        Write-WrappedMessage 'Up/Down: choose a source. Enter: confirm. Esc: cancel.' Gray
+        Write-Host ''
+        try {
+            Write-Host -NoNewline "${Esc}[?25l"
+            while ($true) {
+                $Height = 20
+                try { $Height = [Math]::Max(1, [Math]::Min(20, ([Console]::WindowHeight - 6))) } catch {}
+                $Start = [int][Math]::Floor($Selected / $Height) * $Height
+                $End = [Math]::Min($Choices.Count, ($Start + $Height))
+                if ($Drawn -gt 0) { Write-Host -NoNewline "${Esc}[${Drawn}A" }
+                $Width = (Get-TerminalWidth) - 1
+                $PageRows = $End - $Start
+                $RenderRows = [Math]::Max($PageRows, $Drawn)
+                for ($j = 0; $j -lt $RenderRows; $j++) {
+                    Write-Host -NoNewline "`r${Esc}[2K"
+                    if ($j -lt $PageRows) {
+                        $i = $Start + $j
+                        $ChoiceItem = $Choices[$i]
+                        if ($ChoiceItem.Kind -eq 'Spacer') {
+                            Write-Host ''
+                        } elseif ($ChoiceItem.Kind -eq 'Header') {
+                            $Header = "  $($ChoiceItem.Name)"
+                            if ($Header.Length -gt $Width) { $Header = $Header.Substring(0, [Math]::Max(1, ($Width - 3))) + '...' }
+                            Write-ColorLine $Header '180;130;255' Magenta
+                        } else {
+                            $Mark = if ($i -eq $Selected) { '>' } else { ' ' }
+                            $Label = "$Mark $($ChoiceItem.Name)"
+                            if ($Label.Length -gt $Width) { $Label = $Label.Substring(0, [Math]::Max(1, ($Width - 3))) + '...' }
+                            if ($i -eq $Selected) {
+                                Write-Host "${Esc}[48;2;20;40;60m${Esc}[38;2;70;225;255m$Label${Esc}[0m"
+                            } else {
+                                Write-ColorLine $Label '205;215;225' Gray
+                            }
+                        }
+                    } else { Write-Host '' }
+                }
+                $Drawn = $RenderRows
+                $Key = [Console]::ReadKey($true)
+                switch ($Key.Key) {
+                    'UpArrow' {
+                        $SelectedPos = ($SelectedPos + $SelectableIndexes.Count - 1) % $SelectableIndexes.Count
+                        $Selected = $SelectableIndexes[$SelectedPos]
+                    }
+                    'DownArrow' {
+                        $SelectedPos = ($SelectedPos + 1) % $SelectableIndexes.Count
+                        $Selected = $SelectableIndexes[$SelectedPos]
+                    }
+                    'Home' { $SelectedPos = 0; $Selected = $SelectableIndexes[$SelectedPos] }
+                    'End'  { $SelectedPos = $SelectableIndexes.Count - 1; $Selected = $SelectableIndexes[$SelectedPos] }
+                    'Enter'  { return $Choices[$Selected] }
+                    'Escape' { return $null }
+                }
+            }
+        } finally { Write-Host -NoNewline "${Esc}[0m${Esc}[?25h" }
+    }
+
+    $NumberedChoices = New-Object 'System.Collections.Generic.List[object]'
+    $Number = 0
+    foreach ($ChoiceItem in $Choices) {
+        if ($ChoiceItem.Kind -eq 'Spacer') {
+            Write-Host ''
+            continue
+        }
+        if ($ChoiceItem.Kind -eq 'Header') {
+            Write-ColorLine " $($ChoiceItem.Name)" '180;130;255' Magenta
+            continue
+        }
+        $Number++
+        $NumberedChoices.Add($ChoiceItem)
+        $Label = '{0,2}. {1}' -f $Number, $ChoiceItem.Name
+        Write-ColorLine $Label $script:MenuRgbColors[($Number - 1) % $script:MenuRgbColors.Count] $script:MenuColors[($Number - 1) % $script:MenuColors.Count]
+    }
+    Write-WrappedMessage ' Q. Quit' Gray
+    do {
+        $Choice = (Read-Host 'Choose a source').Trim()
+        if ([string]::IsNullOrWhiteSpace($Choice) -or $Choice -ieq 'q') { return $null }
+        $ChoiceNumber = 0
+        $ValidChoice = [int]::TryParse($Choice, [ref]$ChoiceNumber) -and $ChoiceNumber -ge 1 -and $ChoiceNumber -le $NumberedChoices.Count
+        if (-not $ValidChoice) {
+            Write-Host ('Choose a number from 1 to {0}.' -f $NumberedChoices.Count) -ForegroundColor Yellow
+        }
+    } until ($ValidChoice)
+    return $NumberedChoices[$ChoiceNumber - 1]
 }
 
 function Export-RowsCsv {
@@ -298,6 +473,49 @@ function Select-ReviewFolder {
         }
     } until ($ValidChoice)
     return $Folders[$Number - 1].Item
+}
+
+
+function Select-ReviewFolderTree {
+    param(
+        [System.IO.DirectoryInfo]$StartFolder,
+        [string[]]$ExcludeTopLevel = @()
+    )
+
+    $Current = $StartFolder
+    while ($true) {
+        $Children = @()
+        try {
+            $Children = @(Get-ChildItem -LiteralPath $Current.FullName -Directory -Force -ErrorAction Stop |
+                Where-Object {
+                    ($Current.FullName -ine $StartFolder.FullName) -or ($ExcludeTopLevel -notcontains $_.Name)
+                } |
+                Sort-Object Name)
+        } catch {
+            Write-WrappedMessage ("Cannot enumerate subfolders in {0}: {1}" -f $Current.FullName, $_.Exception.Message) Yellow
+            return $Current
+        }
+
+        # A leaf folder is the natural end of the drill-down.
+        if ($Children.Count -eq 0) { return $Current }
+
+        Write-Host ''
+        Write-ColorLine 'Choose a folder to review:' '180;130;255' Magenta
+        Write-Host ''
+        Write-ColorLine ("Current folder: {0}" -f $Current.FullName) '205;215;225' Gray
+        Write-Host ''
+        Write-WrappedMessage 'Choose a subfolder to keep drilling down, or choose the first entry to review the current folder.' Gray
+        Write-Host ''
+
+        $CurrentLabel = if ([string]::IsNullOrWhiteSpace($Current.Name)) { $Current.FullName } else { $Current.Name }
+        $Choices = @([pscustomobject]@{ Name = "[review this folder: $CurrentLabel]"; Item = $Current }) +
+            @($Children | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Item = $_ } })
+
+        $Picked = Select-ReviewFolder -Folders $Choices
+        if ($Picked.FullName -ieq $Current.FullName) { return $Current }
+
+        $Current = $Picked
+    }
 }
 
 $MenuColors = @('Red', 'DarkYellow', 'Yellow', 'DarkYellow', 'Green', 'DarkGreen',
@@ -687,34 +905,68 @@ if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
         Write-Host ''
         Write-WrappedMessage 'Choose a source folder:' Cyan
         Write-Host ''
-        Write-WrappedMessage '1. Browse for a folder' Gray
-        Write-WrappedMessage '2. Enter a local or network path' Gray
-        Write-WrappedMessage '3. Desktop' Gray
-        Write-WrappedMessage '4. Documents' Gray
-        Write-WrappedMessage '5. Downloads' Gray
-        Write-WrappedMessage 'Q. Quit' Gray
-        Write-Host ''
-        $Choice = (Read-Host 'Choose 1-5, enter a path, or Q').Trim()
-        if ([string]::IsNullOrWhiteSpace($Choice) -or $Choice -ieq 'q') {
+
+        $SourceChoices = New-Object 'System.Collections.Generic.List[object]'
+        $SourceChoices.Add([pscustomobject]@{ Name = 'LOCATIONS'; Kind = 'Header'; Value = '' })
+        $SourceChoices.Add([pscustomobject]@{ Name = 'Browse for a folder...'; Kind = 'Browse'; Value = '' })
+        $SourceChoices.Add([pscustomobject]@{ Name = 'Enter a local or network path...'; Kind = 'Path'; Value = '' })
+        $SourceChoices.Add([pscustomobject]@{ Name = 'Desktop'; Kind = 'Path'; Value = 'desktop' })
+        $SourceChoices.Add([pscustomobject]@{ Name = 'Documents'; Kind = 'Path'; Value = 'documents' })
+        $SourceChoices.Add([pscustomobject]@{ Name = 'Downloads'; Kind = 'Path'; Value = 'downloads' })
+
+        $LocalDrives = @(Get-LocalDrives)
+        if ($LocalDrives.Count -gt 0) {
+            $SourceChoices.Add([pscustomobject]@{ Name = ''; Kind = 'Spacer'; Value = '' })
+            $SourceChoices.Add([pscustomobject]@{ Name = 'LOCAL DRIVES'; Kind = 'Header'; Value = '' })
+            foreach ($Drive in $LocalDrives) {
+                $Display = if ([string]::IsNullOrWhiteSpace([string]$Drive.VolumeName)) {
+                    '{0}:\' -f $Drive.Name
+                } else {
+                    '{0}:\  {1}' -f $Drive.Name, $Drive.VolumeName
+                }
+                $SourceChoices.Add([pscustomobject]@{ Name = $Display; Kind = 'Path'; Value = $Drive.Root })
+            }
+        }
+
+        $NetworkDrives = @(Get-MappedNetworkDrives)
+        if ($NetworkDrives.Count -gt 0) {
+            $SourceChoices.Add([pscustomobject]@{ Name = ''; Kind = 'Spacer'; Value = '' })
+            $SourceChoices.Add([pscustomobject]@{ Name = 'NETWORK DRIVES'; Kind = 'Header'; Value = '' })
+            foreach ($Drive in $NetworkDrives) {
+                $Display = if ([string]::IsNullOrWhiteSpace([string]$Drive.RemotePath)) {
+                    '{0}:\  [mapped network drive]' -f $Drive.Name
+                } else {
+                    '{0}:\  {1}' -f $Drive.Name, $Drive.RemotePath
+                }
+                $SourceChoices.Add([pscustomobject]@{ Name = $Display; Kind = 'Path'; Value = $Drive.Root })
+            }
+        }
+
+        $Selection = Select-SourceMenu -Choices $SourceChoices.ToArray()
+        if ($null -eq $Selection) {
             Write-Host 'Cancelled.' -ForegroundColor Yellow
             return
         }
+
         $Entry = ''
-        switch ($Choice) {
-            '1' {
+        switch ($Selection.Kind) {
+            'Browse' {
                 try { $Entry = Select-SourceFolderDialog }
                 catch {
                     Write-WrappedMessage ('Folder browser unavailable: ' + $_.Exception.Message)
-                    Write-WrappedMessage 'Choose option 2 to enter the path instead.'
+                    Write-WrappedMessage 'Choose "Enter a local or network path" instead.'
                     continue
                 }
             }
-            '2' { $Entry = Read-Host 'Source path (Enter to return to the menu)' }
-            '3' { $Entry = 'desktop' }
-            '4' { $Entry = 'documents' }
-            '5' { $Entry = 'downloads' }
-            default { $Entry = $Choice }
+            'Path' {
+                if ([string]::IsNullOrWhiteSpace([string]$Selection.Value)) {
+                    $Entry = Read-Host 'Source path (Enter to return to the menu)'
+                } else {
+                    $Entry = [string]$Selection.Value
+                }
+            }
         }
+
         # Cancelling the picker or leaving the path blank returns to the menu.
         if ([string]::IsNullOrWhiteSpace($Entry)) { continue }
         $Candidate = Resolve-SourceInput $Entry
@@ -745,16 +997,15 @@ while ($true) {
     $ReportFolder = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ReportFolder)
     $ReportNormal = $ReportFolder.TrimEnd('\') + '\'
     if (-not $ReportNormal.StartsWith($SourceNormal, [StringComparison]::OrdinalIgnoreCase)) { break }
-    Write-Host ''
-    Write-WrappedMessage 'Choose a report folder outside the source folder, so nothing is written to the tree being audited.'
+    Write-Host ''    Write-WrappedMessage 'Choose a report folder outside the source folder, so nothing is written to the tree being audited.'
     Write-WrappedMessage "Source folder: $SourceRoot" Gray
     Write-WrappedMessage "Report folder: $ReportFolder" Gray
     Write-WrappedMessage 'Enter a different report folder. To cancel, press Ctrl+C.'
     $ReportFolder = ''
 }
-# Only enumerate child choices when a child selection is needed.
+# Choose the review target. Interactive selection drills down one folder level at a time.
 $TopLevelFolders = @()
-if (-not $ScanRoot) {
+if (-not $ScanRoot -and -not [string]::IsNullOrWhiteSpace($FolderName)) {
     $TopLevelFolders = @(Get-ChildItem -LiteralPath $SourceRoot -Directory -Force |
         Where-Object { $ExcludeFolder -notcontains $_.Name } |
         Sort-Object Name)
@@ -762,17 +1013,7 @@ if (-not $ScanRoot) {
 if ($ScanRoot) {
     $TargetFolder = $SourceDirectory
 } elseif ([string]::IsNullOrWhiteSpace($FolderName)) {
-    Write-Host ''
-    Write-ColorLine 'Choose a folder to review:' '180;130;255' Magenta
-    Write-Host ''
-    Write-ColorLine "Source folder: $SourceRoot" '205;215;225' Gray
-    Write-Host ''
-    Write-WrappedMessage 'The first entry scans the entire source folder, including files directly inside it.' Gray
-    Write-Host ''
-    $RootLabel = if ([string]::IsNullOrWhiteSpace($SourceDirectory.Name)) { $SourceRoot } else { $SourceDirectory.Name }
-    $Choices = @([PSCustomObject]@{ Name = "(entire source folder: $RootLabel)"; Item = $SourceDirectory }) +
-        @($TopLevelFolders | ForEach-Object { [PSCustomObject]@{ Name = $_.Name; Item = $_ } })
-    try { $TargetFolder = Select-ReviewFolder -Folders $Choices }
+    try { $TargetFolder = Select-ReviewFolderTree -StartFolder $SourceDirectory -ExcludeTopLevel $ExcludeFolder }
     catch [OperationCanceledException] {
         Write-Host 'Cancelled.' -ForegroundColor Yellow
         return
