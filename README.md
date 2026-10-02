@@ -7,6 +7,7 @@ Select a local folder or network share, inventory its files and descendants, and
 ## Requirements
 
 - Windows with Windows PowerShell 5.1 or PowerShell 7.
+- A console host with VT support is recommended for the arrow-key menus. `-NumberedMenu` remains available as a fallback.
 - Read access to the source and write access to the report destination.
 - Desktop Microsoft Excel is optional. It enables formatted XLSX reports; CSV reports are always produced after a completed scan.
 
@@ -21,7 +22,7 @@ Unblock-File -LiteralPath 'C:\PS\FolderReview.ps1'
 & 'C:\PS\FolderReview.ps1'
 ```
 
-Follow the source menu to browse for a folder, enter a local or network path, or choose Desktop, Documents, or Downloads. Then choose where to save reports and whether to scan the entire source or one immediate child folder.
+Follow the source menu with the Up/Down arrow keys and Enter. It groups common locations, local drives, and mapped network drives into separate sections; mapped drives show both the drive letter and UNC target. You can also browse for a folder or type a local path, drive letter, or UNC path directly. After choosing a source, the folder navigator drills down through subfolders until you reach the folder you want to review. At any level you can choose `[review this folder: ...]` to stop there; if a folder has no child folders, it becomes the review target automatically.
 
 The default destination is `FolderReviewReports` on the current user's Desktop. Reports must be outside the source folder. Scanning an entire drive therefore requires a report destination on another drive or a network share.
 
@@ -78,7 +79,10 @@ The terminal reports file count, folder count, issue count, and overall size. Wh
 # Exclude named top-level folders and selected filenames
 .\FolderReview.ps1 -SourceRoot '\\server\share' -ScanRoot -ReportFolder 'C:\Reports' -ExcludeFolder 'Archive' -ExcludeFile '~$*','desktop.ini','Thumbs.db','*.tmp'
 
-# Plain terminal output with numbered selection
+# Force numbered selection instead of arrow-key menus
+.\FolderReview.ps1 -NumberedMenu
+
+# Disable VT rendering and use plain terminal output
 .\FolderReview.ps1 -PlainOutput -NumberedMenu
 
 # Skip Windows property lookups; OpenXML author lookup still runs
@@ -106,7 +110,7 @@ Ctrl+C or closing the terminal may bypass completion messages; previously flushe
 
 ## Project status
 
-Interactive scans and workbook creation have been exercised by the author on Windows. Recent revisions were checked statically during development; comprehensive automated Windows/Excel tests are not yet included.
+Interactive scans and workbook creation have been exercised by the author on Windows. The current source picker also enumerates local and mapped network drives visible to the Windows security context running the script. Elevated PowerShell sessions can have a different mapped-drive view from the normal desktop session. Recent revisions were checked statically during development; comprehensive automated Windows/Excel tests are not yet included.
 
 The inventory belongs in a museum. The spreadsheet will have to do.
 
